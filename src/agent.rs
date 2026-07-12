@@ -3,13 +3,15 @@ use async_openai::{Client, config::{Config, OpenAIConfig},
 };
 use tracing::{error, info, debug};
 use crate::error::Error;
+mod memory;
+use memory::AgentMemory;
 
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct Agent<C: Config>{
     client: Client<C>,
     web_search: bool,
-    preserve_history: bool,
+    memory: AgentMemory<InputItem>,
 }
 impl Agent<OpenAIConfig>{
     pub fn new() -> Self {
@@ -17,13 +19,13 @@ impl Agent<OpenAIConfig>{
         Agent{
             client,
             web_search: false,
-            preserve_history: false,
+            memory: AgentMemory::new(),
         }
     }
 }
 impl<C: Config> Agent<C>{
 
-    pub async fn ask_one(&self, question: &str) -> Result<String> {
+    pub async fn ask_one(&mut self, question: &str) -> Result<String> {
         let model = std::env::var("LLM_MODEL")
             .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
         // build input 
@@ -42,6 +44,7 @@ impl<C: Config> Agent<C>{
         debug!("OpenAI Response: {:#?}", response);
         let mut out_text = String::new();
         for output_item in response.output {
+            self.memory.add_item(&output_item);
             match self.process_output_item(&output_item) {
                 Ok(maybe_text) => {
                     if let Some(text) = maybe_text{
@@ -85,17 +88,19 @@ impl<C: Config> Agent<C>{
         Ok(tools)
     }
 
-    fn build_input(&self, input_text: &str) -> Result<InputParam> {
-        let items = vec![
-            // add user message
-            InputItem::EasyMessage(EasyInputMessageArgs::default()
+    fn build_input(&mut self, input_text: &str) -> Result<Vec<InputItem>> {
+        let mut items = self.memory.get_items();
+        // add user message
+        let msg = InputItem::EasyMessage(EasyInputMessageArgs::default()
                 .r#type(MessageType::Message)
                 .role(Role::User)
                 .content(EasyInputContent::Text(input_text.to_string()))
-                .build()?
-            )];
+                .build()?);
+        self.memory.add_item(&msg);
+        items.push(msg);
+
         
-        Ok(InputParam::Items(items))
+        Ok(items)
     }
 
     fn process_output_item(&self, item: &OutputItem) -> Result<Option<String>> {
@@ -144,8 +149,5 @@ impl<C: Config> Agent<C>{
         info!("WebSearch call: \n{:?}\n", web_search_tool_call);
     }
 
-    pub fn preserve_history(&mut self, preserve: bool) {
-        self.preserve_history = preserve;
-    }
 }
 

@@ -54,7 +54,6 @@ async fn ask_question(query: &str) {
 async fn chat_with_agent() {
     let mut agent = agent::Agent::new();
     //agent.with_web_search(true);
-    agent.preserve_history(true);
 
     // interactive loop
     loop {

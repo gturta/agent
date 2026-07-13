@@ -1,24 +1,25 @@
+use async_openai::types::responses::{CreateResponse, InputParam, InputItem, Response};
 
-pub struct AgentMemory<T>{
-    items: Vec<T>
+pub struct AgentMemory{
+    items: Vec<InputItem>
 }
-impl<T:Clone> AgentMemory<T> {
+impl AgentMemory {
     pub fn new() -> Self{
         AgentMemory{
             items: Vec::new(),
         }
     }
 
-    pub fn add_item<I: Into<T>+Clone>(&mut self, item: &I) {
-        let clone = (*item).clone();
-        self.items.push(clone.into());
+    pub fn add_item(&mut self, item: InputItem) {
+        self.items.push(item);
     }
-    pub fn add_items(&mut self, items: &[T]) {
-        let mut clones = Vec::from(items);
-        self.items.append(&mut clones);
+    pub fn history_to_request(&self, request: &mut CreateResponse) {
+        request.input = InputParam::Items(self.items.clone());
     }
-    pub fn get_items(&self) -> Vec<T> {
-        self.items.clone()
+    pub fn history_from_response(&mut self, response: &Response) {
+        for output_item in &response.output {
+            self.add_item(output_item.clone().into());
+        }
     }
 }
 

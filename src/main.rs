@@ -40,7 +40,6 @@ async fn main() {
 
 async fn ask_question(query: &str) {
     let mut agent = agent::Agent::new();
-    agent.with_web_search(true);
     let answer = match agent.ask_one(query).await {
         Ok(answer) => answer,
         Err(err) => {
@@ -53,7 +52,6 @@ async fn ask_question(query: &str) {
 
 async fn chat_with_agent() {
     let mut agent = agent::Agent::new();
-    //agent.with_web_search(true);
 
     // interactive loop
     loop {

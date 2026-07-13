@@ -3,14 +3,12 @@ use async_openai::{error::{OpenAIError}, types::responses::WebSearchToolArgsErro
 #[derive(Debug)]
 pub enum Error{
     Generic(String),
-    Unimplemented(String),
     OpenAI(String),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self{
             Error::Generic(text) => write!(f, "Generic error: {}", text),
-            Error::Unimplemented(text) => write!(f, "Unimplemented error: {}", text),
             Error::OpenAI(text) => write!(f, "OpenAI error: {}", text),
         }
             }

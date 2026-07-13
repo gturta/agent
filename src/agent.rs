@@ -4,21 +4,22 @@ use async_openai::{Client, config::{Config, OpenAIConfig},
 use tracing::{error, info, debug};
 use crate::error::Error;
 mod memory;
+mod tools;
 use memory::AgentMemory;
+use tools::AgentTools;
+
 
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct Agent<C: Config>{
     client: Client<C>,
-    web_search: bool,
-    memory: AgentMemory<InputItem>,
+    memory: AgentMemory,
 }
 impl Agent<OpenAIConfig>{
     pub fn new() -> Self {
         let client = Client::new();
         Agent{
             client,
-            web_search: false,
             memory: AgentMemory::new(),
         }
     }
@@ -28,35 +29,32 @@ impl<C: Config> Agent<C>{
     pub async fn ask_one(&mut self, question: &str) -> Result<String> {
         let model = std::env::var("LLM_MODEL")
             .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
-        // build input 
-        let input = self.build_input(question)?;
         // build tools
-        let tools = self.build_tools()?;
-        let request = CreateResponseArgs::default()
+        let tools = AgentTools::new().build_tools()?;
+        let mut request = CreateResponseArgs::default()
             .model(model)
-            .input(input)
+            .reasoning(Reasoning { effort: Some(ReasoningEffort::Low), summary: Some(ReasoningSummary::Auto) })
             .tools(tools)
             .build()?;
+        // build input 
+        self.build_input(question, &mut request)?;
         debug!("OpenAI Request: {:#?}", request);
         let response = self.client.responses()
             .create(request)
             .await?;
         debug!("OpenAI Response: {:#?}", response);
         let mut out_text = String::new();
+        // update memory from response
+        self.memory.history_from_response(&response);
         for output_item in response.output {
-            self.memory.add_item(&output_item);
             match self.process_output_item(&output_item) {
-                Ok(maybe_text) => {
-                    if let Some(text) = maybe_text{
-                        out_text.push_str(&format!("{}\n{}\n", "-".repeat(10), text));
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        out_text.push_str(&format!("{}\n{}\n", "-".repeat(10), trimmed));
                     }
                 },
-                Err(err) => {
-                    match err {
-                        Error::Unimplemented(feature) => info!("Unimplemented: {}", feature),
-                        _ => error!("Error processing output item: {:?}", err),
-                    }
-                },
+                Err(err) => error!("Error processing output item: {:?}", err),
             }
         }
 
@@ -76,62 +74,29 @@ impl<C: Config> Agent<C>{
         Ok(out_text)
     }
 
-    pub fn with_web_search(&mut self, enable: bool) {
-        self.web_search = enable;
-    }
 
-    fn build_tools(&self) -> Result<Vec<Tool>> {
-        let mut tools = Vec::new();
-        if self.web_search {
-            tools.push(Tool::WebSearch(WebSearchToolArgs::default().build()?));
-        }
-        Ok(tools)
-    }
-
-    fn build_input(&mut self, input_text: &str) -> Result<Vec<InputItem>> {
-        let mut items = self.memory.get_items();
-        // add user message
+    fn build_input(&mut self, input_text: &str, request: &mut CreateResponse) -> Result<()> {
         let msg = InputItem::EasyMessage(EasyInputMessageArgs::default()
                 .r#type(MessageType::Message)
                 .role(Role::User)
                 .content(EasyInputContent::Text(input_text.to_string()))
                 .build()?);
-        self.memory.add_item(&msg);
-        items.push(msg);
-
-        
-        Ok(items)
+        // add user message to history
+        self.memory.add_item(msg);
+        // then add history to request
+        self.memory.history_to_request(request);
+        Ok(())
     }
 
-    fn process_output_item(&self, item: &OutputItem) -> Result<Option<String>> {
+    fn process_output_item(&self, item: &OutputItem) -> Result<String> {
+        let mut output = String::new();
         match item {
-            OutputItem::Message(output_message) => Ok(Some(self.output_message_text(output_message))),
-            OutputItem::FileSearchCall(_file_search_tool_call) => Err(Error::Unimplemented("FileSearchCall".to_owned() )),
-            OutputItem::FunctionCall(_function_tool_call) => Err(Error::Unimplemented("FunctionCall".to_owned() )),
-            OutputItem::FunctionCallOutput(_function_tool_call_output_resource) => Err(Error::Unimplemented("FunctionCallOutput".to_owned(), )),
-            OutputItem::WebSearchCall(web_search_tool_call) => {
-                self.handle_web_search_call(web_search_tool_call);
-                Ok(None)
-            },
-            OutputItem::ComputerCall(_computer_tool_call) => Err(Error::Unimplemented("ComputerCall".to_owned() )),
-            OutputItem::ComputerCallOutput(_computer_tool_call_output_resource) => Err(Error::Unimplemented("ComputerCallOutput".to_owned(), )),
-            OutputItem::Reasoning(_reasoning_item) => Err(Error::Unimplemented("Reasoning".to_owned() )),
-            OutputItem::Compaction(_compaction_body) => Err(Error::Unimplemented("Compaction".to_owned(), )),
-            OutputItem::ImageGenerationCall(_image_gen_tool_call) => Err(Error::Unimplemented("ImageGenerationCall".to_owned() )),
-            OutputItem::CodeInterpreterCall(_code_interpreter_tool_call) => Err(Error::Unimplemented("CodeInterpreterCall".to_owned(), )),
-            OutputItem::LocalShellCall(_local_shell_tool_call) => Err(Error::Unimplemented("LocalShellCall".to_owned() )),
-            OutputItem::ShellCall(_function_shell_call) => Err(Error::Unimplemented("ShellCall".to_owned(), )),
-            OutputItem::ShellCallOutput(_function_shell_call_output) => Err(Error::Unimplemented("ShellCallOutput".to_owned() )),
-            OutputItem::ApplyPatchCall(_apply_patch_tool_call) => Err(Error::Unimplemented("ApplyPatchCall".to_owned(), )),
-            OutputItem::ApplyPatchCallOutput(_apply_patch_tool_call_output) => Err(Error::Unimplemented("ApplyPatchCallOutput".to_owned() )),
-            OutputItem::McpCall(_mcptool_call) => Err(Error::Unimplemented("McpCall".to_owned() )),
-            OutputItem::McpListTools(_mcplist_tools) => Err(Error::Unimplemented("McpListTools".to_owned() )),
-            OutputItem::McpApprovalRequest(_mcpapproval_request) => Err(Error::Unimplemented("McpApprovalRequest".to_owned() )),
-            OutputItem::CustomToolCall(_custom_tool_call) => Err(Error::Unimplemented("CustomToolCall".to_owned(), )),
-            OutputItem::CustomToolCallOutput(_custom_tool_call_output_resource) => Err(Error::Unimplemented("CustomToolCallOutput".to_owned() )),
-            OutputItem::ToolSearchCall(_tool_search_call) => Err(Error::Unimplemented("ToolSearchCall".to_owned() )),
-            OutputItem::ToolSearchOutput(_tool_search_output) => Err(Error::Unimplemented("ToolSearchOutput".to_owned() )),
+            OutputItem::Message(output_message) => output.push_str(&self.output_message_text(output_message)),
+            OutputItem::WebSearchCall(web_search_tool_call) => self.handle_web_search_call(web_search_tool_call),
+            OutputItem::Reasoning(reasoning) => self.handle_reasoning(reasoning),
+            other => info!("Unimplemented: {:?}", other),
         }
+        Ok(output)
     }
 
     fn output_message_text(&self, message: &OutputMessage) -> String {
@@ -144,9 +109,33 @@ impl<C: Config> Agent<C>{
         }
         output
     }
-
     fn handle_web_search_call(&self, web_search_tool_call: &WebSearchToolCall) {
-        info!("WebSearch call: \n{:?}\n", web_search_tool_call);
+        if let Some(action) = &web_search_tool_call.action {
+            let buf = match action {
+                WebSearchToolCallAction::Search(action) => format!("Search ({})", action.query),
+                WebSearchToolCallAction::OpenPage(action) => format!("OpenPage ({})", 
+                    action.url.clone().unwrap_or_default()),
+                WebSearchToolCallAction::Find(action) => format!("Find ({} : {})", 
+                    action.url, action.pattern),
+                WebSearchToolCallAction::FindInPage(action) => format!("FindInPage {} : {}", 
+                    action.url, action.pattern),
+            };
+            info!("WebSearchToolCall: {}", buf);
+        }
+    }
+    fn handle_reasoning(&self, reasoning: &ReasoningItem) {
+        let mut buf = String::new();
+        for SummaryPart::SummaryText(SummaryTextContent{text}) in &reasoning.summary{
+            buf.push_str(&format!("summary: {text}\n"));
+        }
+        if let Some(content) = &reasoning.content {
+            for ReasoningItemContent::ReasoningText(ReasoningTextContent{text}) in content {
+                buf.push_str(&format!("summary: {text}\n"));
+            }
+        }
+        if !buf.trim().is_empty(){
+            info!("===== REASONING START =====\n{buf}===== REASONING END ======");
+        }
     }
 
 }

@@ -14,6 +14,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct Agent<C: Config>{
     client: Client<C>,
     memory: AgentMemory,
+    tools: AgentTools,
 }
 impl Agent<OpenAIConfig>{
     pub fn new() -> Self {
@@ -21,6 +22,7 @@ impl Agent<OpenAIConfig>{
         Agent{
             client,
             memory: AgentMemory::new(),
+            tools: AgentTools::new(),
         }
     }
 }
@@ -30,7 +32,8 @@ impl<C: Config> Agent<C>{
         let model = std::env::var("LLM_MODEL")
             .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
         // build tools
-        let tools = AgentTools::new().build_tools()?;
+        self.tools.build();
+        let tools = self.tools.get_tools();
         let mut request = CreateResponseArgs::default()
             .model(model)
             .reasoning(Reasoning { effort: Some(ReasoningEffort::Low), summary: Some(ReasoningSummary::Auto) })
@@ -94,6 +97,7 @@ impl<C: Config> Agent<C>{
             OutputItem::Message(output_message) => output.push_str(&self.output_message_text(output_message)),
             OutputItem::WebSearchCall(web_search_tool_call) => self.handle_web_search_call(web_search_tool_call),
             OutputItem::Reasoning(reasoning) => self.handle_reasoning(reasoning),
+            OutputItem::FunctionCall(function_call) => self.handle_function_call(function_call),
             other => info!("Unimplemented: {:?}", other),
         }
         Ok(output)
@@ -136,6 +140,15 @@ impl<C: Config> Agent<C>{
         if !buf.trim().is_empty(){
             info!("===== REASONING START =====\n{buf}===== REASONING END ======");
         }
+    }
+
+    fn handle_function_call(&self, function_call: &FunctionToolCall) {
+        info!("Calling function {}", function_call.name);
+
+        match self.tools.execute_function_call(function_call){
+            Ok(value) => info!("Function call {} returned: {}", function_call.name, value),
+            Err(err) => error!("Error execute function call: {}", err),
+        };
     }
 
 }

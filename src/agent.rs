@@ -1,7 +1,7 @@
 use async_openai::{Client, config::{Config, OpenAIConfig},
     types::responses::*
 };
-use tracing::{error, info, debug};
+use tracing::{error, warn, info, debug};
 use crate::error::Error;
 mod memory;
 mod tools;
@@ -13,48 +13,80 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub struct Agent<C: Config>{
     client: Client<C>,
+    model: String,
     memory: AgentMemory,
     tools: AgentTools,
+    max_loops: u32,
+    temp_response: String,
 }
 impl Agent<OpenAIConfig>{
-    pub fn new() -> Self {
+    pub fn build() -> Result<Self> {
         let client = Client::new();
-        Agent{
+        let model = std::env::var("LLM_MODEL")
+            .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
+        // build tools
+        let tools = AgentTools::new()
+            .with_web_search(false)
+            .build();
+        let memory = AgentMemory::new();
+        Ok(Agent{
             client,
-            memory: AgentMemory::new(),
-            tools: AgentTools::new(),
-        }
+            model,
+            memory,
+            tools,
+            max_loops: 3,
+            temp_response: String::new()
+        })
     }
 }
 impl<C: Config> Agent<C>{
 
     pub async fn ask_one(&mut self, question: &str) -> Result<String> {
-        let model = std::env::var("LLM_MODEL")
-            .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
-        // build tools
-        self.tools.build();
-        let tools = self.tools.get_tools();
-        let mut request = CreateResponseArgs::default()
-            .model(model)
-            .reasoning(Reasoning { effort: Some(ReasoningEffort::Low), summary: Some(ReasoningSummary::Auto) })
-            .tools(tools)
-            .build()?;
-        // build input 
-        self.build_input(question, &mut request)?;
-        debug!("OpenAI Request: {:#?}", request);
-        let response = self.client.responses()
-            .create(request)
-            .await?;
-        debug!("OpenAI Response: {:#?}", response);
-        let mut out_text = String::new();
+        // add user question to history
+        self.memory.add_item(InputItem::EasyMessage(EasyInputMessageArgs::default()
+                .r#type(MessageType::Message)
+                .role(Role::User)
+                .content(EasyInputContent::Text(question.to_string()))
+                .build()?));
+        
+        let out_text = self.process_one_request().await?;
+        Ok(out_text)
+    }
+
+    async fn process_one_request(&mut self) -> Result<String> {
+        let mut done = false;
+        let mut current_iteration = 0;
+        while !done {
+            done = true;
+            // 1. build request
+            let request = self.build_request()?;
+            // 2. send request
+            let response = self.send_request(request).await?;
+            // 3. process output
+            self.process_response(response)?;
+            // 4. execute tools
+            self.execute_tools()?;
+            
+            current_iteration += 1;
+            if current_iteration > self.max_loops {
+                warn!("Agent loop iteration reached max loops, exiting");
+                break;
+            }
+        }
+        Ok(self.build_final_output())
+    }
+
+    fn process_response(&mut self, response: Response) -> Result<()> {
+        self.temp_response.clear();
         // update memory from response
         self.memory.history_from_response(&response);
+        // Process Response.output
         for output_item in response.output {
             match self.process_output_item(&output_item) {
                 Ok(text) => {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
-                        out_text.push_str(&format!("{}\n{}\n", "-".repeat(10), trimmed));
+                        self.temp_response.push_str(&format!("{}\n{}\n", "-".repeat(10), trimmed));
                     }
                 },
                 Err(err) => error!("Error processing output item: {:?}", err),
@@ -65,33 +97,43 @@ impl<C: Config> Agent<C>{
         if let Some(incomplete) = response.incomplete_details {
             let incomplete_text = format!("\n{}\nIncomplete answer reason: {}",
                 "-".repeat(10), incomplete.reason);
-            out_text.push_str(&incomplete_text);
+            self.temp_response.push_str(&incomplete_text);
         }
         
         // add usage info
         if let Some(usage) = response.usage {
             let usage_txt = format!("\n{}\nUsage total: {}, input: {}, output: {}",
                 "-".repeat(10), usage.total_tokens, usage.input_tokens, usage.output_tokens);
-            out_text.push_str(&usage_txt);
+            self.temp_response.push_str(&usage_txt);
         }
-        Ok(out_text)
-    }
-
-
-    fn build_input(&mut self, input_text: &str, request: &mut CreateResponse) -> Result<()> {
-        let msg = InputItem::EasyMessage(EasyInputMessageArgs::default()
-                .r#type(MessageType::Message)
-                .role(Role::User)
-                .content(EasyInputContent::Text(input_text.to_string()))
-                .build()?);
-        // add user message to history
-        self.memory.add_item(msg);
-        // then add history to request
-        self.memory.history_to_request(request);
         Ok(())
     }
 
-    fn process_output_item(&self, item: &OutputItem) -> Result<String> {
+    fn build_final_output(&mut self) -> String {
+        self.temp_response.clone()
+    }
+
+    fn build_request(&mut self) -> Result<CreateResponse> {
+        let mut request = CreateResponseArgs::default()
+            .model(&self.model)
+            .reasoning(Reasoning { effort: Some(ReasoningEffort::Low), summary: Some(ReasoningSummary::Auto) })
+            .tools(self.tools.get_tools())
+            .build()?;
+        // add input 
+        self.memory.history_to_request(&mut request);
+        debug!("OpenAI Request: {:#?}", request);
+        Ok(request)
+    }
+
+    async fn send_request(&mut self, request: CreateResponse) -> Result<Response> {
+        let response = self.client.responses()
+            .create(request)
+            .await?;
+        debug!("OpenAI Response: {:#?}", response);
+        Ok(response)
+    }
+
+    fn process_output_item(&mut self, item: &OutputItem) -> Result<String> {
         let mut output = String::new();
         match item {
             OutputItem::Message(output_message) => output.push_str(&self.output_message_text(output_message)),
@@ -142,14 +184,13 @@ impl<C: Config> Agent<C>{
         }
     }
 
-    fn handle_function_call(&self, function_call: &FunctionToolCall) {
-        info!("Calling function {}", function_call.name);
-
-        match self.tools.execute_function_call(function_call){
-            Ok(value) => info!("Function call {} returned: {}", function_call.name, value),
-            Err(err) => error!("Error execute function call: {}", err),
-        };
+    fn handle_function_call(&mut self, function_call: &FunctionToolCall) {
+        info!("Received FunctionToolCall request for {}", function_call.name);
+        self.tools.collect_execution_request(function_call);
     }
-
+    fn execute_tools(&mut self) -> Result<()> {
+        self.tools.execute_collected_requests();
+        Ok(())
+    }
 }
 

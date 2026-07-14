@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::pin::Pin;
+use std::future::Future;
 use std::collections::HashMap;
 use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, WebSearchToolArgs};
 use serde_json::{Value,json};
@@ -5,8 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use schemars::{JsonSchema, schema_for};
 use tracing::{info, error};
 
-use crate::error::Error;
-type Result<T> = std::result::Result<T, Error>;
+use crate::error::{Error, Result};
 mod doc_search_tool;
 use doc_search_tool::DocSearchTool;
 
@@ -16,7 +18,7 @@ pub trait ToolDefinition{
     // required functions
     fn name(&self) -> String;
     fn description(&self) -> String;
-    fn execute(&self, args: Self::Params) -> Result<Self::Output>;
+    fn execute(&self, args: Self::Params) -> impl std::future::Future<Output = Result<Self::Output>> + Send + Sync;
 }
 
 trait ToolDefinitionDyn{
@@ -24,11 +26,11 @@ trait ToolDefinitionDyn{
     fn tool_name(&self) -> String;
     fn tool_description(&self) -> String;
     fn tool_parameters(&self) -> Value;
-    fn tool_execute(&self, args: Value) -> Result<Value>;
+    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + Sync + '_ >>;
 }
 impl<T> ToolDefinitionDyn for T 
     where 
-        T: ToolDefinition,
+        T: ToolDefinition + Sync,
         T::Params: JsonSchema + DeserializeOwned,
         T::Output: Serialize
 {
@@ -42,22 +44,24 @@ impl<T> ToolDefinitionDyn for T
         let schema = schema_for!(T::Params);
         serde_json::to_value(schema).unwrap_or(json!({ "type": "object" }))
     }
-    fn tool_execute(&self, args: Value) -> Result<Value> {
-        info!("Start tool execute: {}({})", self.name(), args);
-        let parsed_args: T::Params = serde_json::from_value(args)
-            .map_err(|e| Error::Serde(format!("Unable to parse params for {}: {}", self.name(), e)))?;
+    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + Sync + '_ >> {
+        Box::pin(async {
+            info!("Start tool execute: {}({})", self.name(), args);
+            let parsed_args: T::Params = serde_json::from_value(args)
+                .map_err(|e| Error::Serde(format!("Unable to parse params for {}: {}", self.name(), e)))?;
 
-        let output = self.execute(parsed_args)
-            .map_err(|e| Error::Tool(format!("Tool {} execute error: {}", self.name(), e)))?;
-        let val = serde_json::to_value(output)
-            .map_err(|e| Error::Tool(format!("Tool {} output parse error: {}", self.name(), e)))?;
-        Ok(val)
+            let output = self.execute(parsed_args).await
+                .map_err(|e| Error::Tool(format!("Tool {} execute error: {}", self.name(), e)))?;
+            let val = serde_json::to_value(output)
+                .map_err(|e| Error::Tool(format!("Tool {} output parse error: {}", self.name(), e)))?;
+            Ok(val)
+        })
     }
 }
 
 pub struct AgentTools{
     web_search: bool,
-    custom_tools: HashMap<String, Box<dyn ToolDefinitionDyn>>, 
+    custom_tools: HashMap<String, Arc<dyn ToolDefinitionDyn + Sync + Send>>, 
     execution_requests: Vec<FunctionToolCall>
 }
 
@@ -71,7 +75,7 @@ impl AgentTools{
     }
     pub fn build(mut self) -> Self {
         let search_tool = DocSearchTool{};
-        self.custom_tools.insert(search_tool.name(), Box::new(search_tool));
+        self.custom_tools.insert(search_tool.name(), Arc::new(search_tool));
         self
     }
     
@@ -105,23 +109,43 @@ impl AgentTools{
         self.execution_requests.clear();
         self.execution_requests.push(function_call.clone());
     }
-    pub fn execute_collected_requests(&mut self) {
+
+    pub async fn execute_collected_requests(&mut self) -> Result<()> {
+        let mut handles = Vec::new();
         for tool_req in &self.execution_requests {
-            match self.execute_function_call(tool_req) {
-                Ok(result) => info!("FunctionToolCall returned: {}", result),
-                Err(err) => error!("FunctionToolCall error: {}", err),
+            // get the tool requested in FunctionToolCall
+            if let Some(tool) = self.custom_tools.get(&tool_req.name){
+                // concurrent execution
+                let tool_clone = tool.clone();
+                let req_clone = tool_req.clone();
+                handles.push(tokio::spawn(async move {
+                    // unpack arguments
+                    let args: Value = serde_json::from_str(&req_clone.arguments)?;
+                    // execute tool, return result
+                    tool_clone.tool_execute(args).await
+                }));
+            } 
+            else {
+                error!("Tool {} not found", tool_req.name);
             }
         }
-    }
-
-
-    fn execute_function_call(&self, function_call: &FunctionToolCall) -> Result<Value> {
-        if let Some(tool) = self.custom_tools.get(&function_call.name){
-            let args: Value = serde_json::from_str(&function_call.arguments)?;
-            let output = tool.tool_execute(args);
-            return output;
+        for h in handles {
+            match h.await{
+                Ok(result) => match result {
+                    Ok(result) => {
+                        info!("FunctionToolCall returned: {}", result);
+                        // return InputItem::Item::FunctionCallOutput 
+                        // with the id's from the FunctionToolCall
+                        todo!();
+                    },
+                    Err(err) =>  error!("FunctionToolCall error: {}", err),
+                },
+                Err(err) => error!("Join error for FunctionToolCall: {}", err),
+            }
         }
-        Err(Error::Generic("Tool not found".into()))
+        Ok(())
     }
+
+
 }
 

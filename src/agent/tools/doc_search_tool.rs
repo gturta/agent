@@ -25,9 +25,9 @@ impl ToolDefinition for DocSearchTool{
     fn description(&self) -> String {
         "Documentation search for boiler type XV33AB".to_owned()
     }
-    fn execute(&self, args: Self::Params) -> Result<Self::Output> {
+    async fn execute(&self, args: Self::Params) -> Result<Self::Output> {
         info!("DocSearchTool execute(query: \"{}\", max: {:?})", args.query, args.max);
 
-        Err(Error::Generic("DocSearchTool unimplemented".to_string()))
+        Ok("DocSearchTool dummy implementation".to_string())
     }
 }

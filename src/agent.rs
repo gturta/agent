@@ -2,14 +2,12 @@ use async_openai::{Client, config::{Config, OpenAIConfig},
     types::responses::*
 };
 use tracing::{error, warn, info, debug};
-use crate::error::Error;
+use crate::error::{Error, Result};
 mod memory;
 mod tools;
 use memory::AgentMemory;
 use tools::AgentTools;
 
-
-type Result<T> = std::result::Result<T, Error>;
 
 pub struct Agent<C: Config>{
     client: Client<C>,
@@ -65,7 +63,7 @@ impl<C: Config> Agent<C>{
             // 3. process output
             self.process_response(response)?;
             // 4. execute tools
-            self.execute_tools()?;
+            self.execute_tools().await?;
             
             current_iteration += 1;
             if current_iteration > self.max_loops {
@@ -188,8 +186,8 @@ impl<C: Config> Agent<C>{
         info!("Received FunctionToolCall request for {}", function_call.name);
         self.tools.collect_execution_request(function_call);
     }
-    fn execute_tools(&mut self) -> Result<()> {
-        self.tools.execute_collected_requests();
+    async fn execute_tools(&mut self) -> Result<()> {
+        let _= self.tools.execute_collected_requests().await;
         Ok(())
     }
 }

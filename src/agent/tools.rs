@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::pin::Pin;
 use std::future::Future;
 use std::collections::HashMap;
-use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, WebSearchToolArgs};
+use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, WebSearchToolArgs, FunctionCallOutputItemParam, FunctionCallOutput, OutputStatus};
 use serde_json::{Value,json};
 use serde::{de::DeserializeOwned, Serialize};
 use schemars::{JsonSchema, schema_for};
@@ -18,19 +18,19 @@ pub trait ToolDefinition{
     // required functions
     fn name(&self) -> String;
     fn description(&self) -> String;
-    fn execute(&self, args: Self::Params) -> impl std::future::Future<Output = Result<Self::Output>> + Send + Sync;
+    fn execute(&self, args: Self::Params) -> impl std::future::Future<Output = Result<Self::Output>> + Send;
 }
 
-trait ToolDefinitionDyn{
+trait ToolDefinitionDyn: Send + Sync{
     // required functions
     fn tool_name(&self) -> String;
     fn tool_description(&self) -> String;
     fn tool_parameters(&self) -> Value;
-    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + Sync + '_ >>;
+    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_ >>;
 }
 impl<T> ToolDefinitionDyn for T 
     where 
-        T: ToolDefinition + Sync,
+        T: ToolDefinition + Send + Sync,
         T::Params: JsonSchema + DeserializeOwned,
         T::Output: Serialize
 {
@@ -44,7 +44,7 @@ impl<T> ToolDefinitionDyn for T
         let schema = schema_for!(T::Params);
         serde_json::to_value(schema).unwrap_or(json!({ "type": "object" }))
     }
-    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + Sync + '_ >> {
+    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_ >> {
         Box::pin(async {
             info!("Start tool execute: {}({})", self.name(), args);
             let parsed_args: T::Params = serde_json::from_value(args)
@@ -61,7 +61,7 @@ impl<T> ToolDefinitionDyn for T
 
 pub struct AgentTools{
     web_search: bool,
-    custom_tools: HashMap<String, Arc<dyn ToolDefinitionDyn + Sync + Send>>, 
+    custom_tools: HashMap<String, Arc<dyn ToolDefinitionDyn>>, 
     execution_requests: Vec<FunctionToolCall>
 }
 
@@ -110,8 +110,10 @@ impl AgentTools{
         self.execution_requests.push(function_call.clone());
     }
 
-    pub async fn execute_collected_requests(&mut self) -> Result<()> {
+    pub async fn execute_collected_requests(&mut self) -> Result<Vec<FunctionCallOutputItemParam>> {
         let mut handles = Vec::new();
+
+        // 1. spawn tasks for each FunctionToolCall request
         for tool_req in &self.execution_requests {
             // get the tool requested in FunctionToolCall
             if let Some(tool) = self.custom_tools.get(&tool_req.name){
@@ -122,28 +124,42 @@ impl AgentTools{
                     // unpack arguments
                     let args: Value = serde_json::from_str(&req_clone.arguments)?;
                     // execute tool, return result
-                    tool_clone.tool_execute(args).await
+                    match tool_clone.tool_execute(args).await{
+                        Ok(result) => {
+                            // pack the result 
+                            Ok(FunctionCallOutputItemParam{
+                                call_id: req_clone.call_id,
+                                output: FunctionCallOutput::Text(result.to_string()),
+                                id: None,
+                                status: Some(OutputStatus::Completed),
+                            })
+                        },
+                        Err(err) => Err(err),
+                    }
                 }));
             } 
             else {
                 error!("Tool {} not found", tool_req.name);
             }
         }
+
+        // 2. collect results from spawned tasks
+        let mut output = Vec::new();
         for h in handles {
             match h.await{
                 Ok(result) => match result {
                     Ok(result) => {
-                        info!("FunctionToolCall returned: {}", result);
+                        info!("FunctionToolCall returned: {:?}", result);
                         // return InputItem::Item::FunctionCallOutput 
                         // with the id's from the FunctionToolCall
-                        todo!();
+                        output.push(result);
                     },
                     Err(err) =>  error!("FunctionToolCall error: {}", err),
                 },
                 Err(err) => error!("Join error for FunctionToolCall: {}", err),
             }
         }
-        Ok(())
+        Ok(output)
     }
 
 

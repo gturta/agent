@@ -15,6 +15,7 @@ pub struct Agent<C: Config>{
     memory: AgentMemory,
     tools: AgentTools,
     max_loops: u32,
+    answer_complete: bool,
     temp_response: String,
 }
 impl Agent<OpenAIConfig>{
@@ -33,6 +34,7 @@ impl Agent<OpenAIConfig>{
             memory,
             tools,
             max_loops: 3,
+            answer_complete: false,
             temp_response: String::new()
         })
     }
@@ -52,10 +54,11 @@ impl<C: Config> Agent<C>{
     }
 
     async fn process_one_request(&mut self) -> Result<String> {
-        let mut done = false;
+        self.answer_complete = false;
         let mut current_iteration = 0;
-        while !done {
-            done = true;
+        while !self.answer_complete {
+            // answer_complete will be set to false if there are tool calls required
+            self.answer_complete = true;
             // 1. build request
             let request = self.build_request()?;
             // 2. send request
@@ -185,9 +188,11 @@ impl<C: Config> Agent<C>{
     fn handle_function_call(&mut self, function_call: &FunctionToolCall) {
         info!("Received FunctionToolCall request for {}", function_call.name);
         self.tools.collect_execution_request(function_call);
+        self.answer_complete = false;
     }
     async fn execute_tools(&mut self) -> Result<()> {
-        let _= self.tools.execute_collected_requests().await;
+        let tool_results = self.tools.execute_collected_requests().await?;
+        tool_results.into_iter().for_each(|r| self.memory.add_item(InputItem::Item(Item::from(r))));
         Ok(())
     }
 }

@@ -28,6 +28,6 @@ impl ToolDefinition for DocSearchTool{
     async fn execute(&self, args: Self::Params) -> Result<Self::Output> {
         info!("DocSearchTool execute(query: \"{}\", max: {:?})", args.query, args.max);
 
-        Ok("DocSearchTool dummy implementation".to_string())
+        Ok("Pentru inlocuirea cazanului este extrem de important sa invartiti surubul verde de trei ori spre stanga.".to_string())
     }
 }

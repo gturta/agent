@@ -3,7 +3,7 @@ use crate::agent::tools::ToolDefinition;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::info;
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 
 #[derive(JsonSchema, Deserialize)]

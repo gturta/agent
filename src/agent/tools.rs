@@ -6,11 +6,11 @@ use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, W
 use serde_json::{Value,json};
 use serde::{de::DeserializeOwned, Serialize};
 use schemars::{JsonSchema, schema_for};
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 use crate::error::{Error, Result};
-mod doc_search_tool;
-use doc_search_tool::DocSearchTool;
+mod local; 
+use local::LocalTools;
 
 pub trait ToolDefinition{
     type Params;
@@ -59,37 +59,52 @@ impl<T> ToolDefinitionDyn for T
     }
 }
 
+trait ToolProvider {
+    fn name(&self) -> String;
+    fn tool_list(&self) -> Vec<Arc<dyn ToolDefinitionDyn + Send + Sync>> ; 
+    fn get(&self, function: &str) -> Option<Arc<dyn ToolDefinitionDyn + Send + Sync>>;
+}
+
 pub struct AgentTools{
     web_search: bool,
-    custom_tools: HashMap<String, Arc<dyn ToolDefinitionDyn>>, 
-    execution_requests: Vec<FunctionToolCall>
+    execution_requests: Vec<FunctionToolCall>,
+    providers: HashMap<String, Arc<dyn ToolProvider>>,
 }
 
 impl AgentTools{
     pub fn new() -> Self{
         Self{
             web_search: false,
-            custom_tools: HashMap::new(),
             execution_requests: Vec::new(),
+            providers: HashMap::new(),
         }
     }
+    fn add_provider(&mut self, provider: impl ToolProvider + 'static) {
+        self.providers.insert(provider.name(), Arc::new(provider));
+    }
+
     pub fn build(mut self) -> Self {
-        let search_tool = DocSearchTool{};
-        self.custom_tools.insert(search_tool.name(), Arc::new(search_tool));
+        let local = LocalTools::build();
+        self.add_provider(local);
         self
     }
     
     pub fn get_tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
-        // add custom FuntionTools
-        for custom_tool in self.custom_tools.values(){
-            // create OpenAI FunctionTool
-            if let Ok(tool) = FunctionToolArgs::default()
-                .name(custom_tool.tool_name())
-                .description(custom_tool.tool_description())
-                .parameters(custom_tool.tool_parameters())
-                .build(){
-                    tools.push(Tool::Function(tool));
+        for provider in self.providers.values() {
+            // add custom FuntionTools
+            for custom_tool in provider.tool_list(){
+                // create OpenAI FunctionTool
+                let qualified_name = format!("{}__{}", provider.name(), custom_tool.tool_name());
+                if let Ok(tool) = FunctionToolArgs::default()
+                    // the tool name will be prefixed with the provider
+                    .name(&qualified_name)
+                        .description(custom_tool.tool_description())
+                        .parameters(custom_tool.tool_parameters())
+                        .build(){
+                            info!("Adding tool {}", qualified_name);
+                            tools.push(Tool::Function(tool));
+                }
             }
         }
         // add WebSearch tool
@@ -115,31 +130,42 @@ impl AgentTools{
 
         // 1. spawn tasks for each FunctionToolCall request
         for tool_req in &self.execution_requests {
-            // get the tool requested in FunctionToolCall
-            if let Some(tool) = self.custom_tools.get(&tool_req.name){
-                // concurrent execution
-                let tool_clone = tool.clone();
-                let req_clone = tool_req.clone();
-                handles.push(tokio::spawn(async move {
-                    // unpack arguments
-                    let args: Value = serde_json::from_str(&req_clone.arguments)?;
-                    // execute tool, return result
-                    match tool_clone.tool_execute(args).await{
-                        Ok(result) => {
-                            // pack the result 
-                            Ok(FunctionCallOutputItemParam{
-                                call_id: req_clone.call_id,
-                                output: FunctionCallOutput::Text(result.to_string()),
-                                id: None,
-                                status: Some(OutputStatus::Completed),
-                            })
-                        },
-                        Err(err) => Err(err),
+            // as I have multiple tool providers (local, mcp) the function name is
+            // "provider_name/function_name"
+            if let Some(split_at) = tool_req.name.find("__"){
+                let provider_name = &tool_req.name[..split_at];
+                let function_name = &tool_req.name[split_at+2..];
+                if let Some(provider) = self.providers.get(provider_name) {
+                    // get the tool requested in FunctionToolCall
+                    if let Some(tool) = provider.get(function_name){
+                        // concurrent execution
+                        let tool_clone = tool.clone();
+                        let req_clone = tool_req.clone();
+                        handles.push(tokio::spawn(async move {
+                            // unpack arguments
+                            let args: Value = serde_json::from_str(&req_clone.arguments)?;
+                            // execute tool, return result
+                            match tool_clone.tool_execute(args).await{
+                                Ok(result) => {
+                                    // pack the result 
+                                    Ok(FunctionCallOutputItemParam{
+                                        call_id: req_clone.call_id,
+                                        output: FunctionCallOutput::Text(result.to_string()),
+                                        id: None,
+                                        status: Some(OutputStatus::Completed),
+                                    })
+                                },
+                                Err(err) => Err(err),
+                            }
+                        }));
+                    } 
+                    else {
+                        warn!("Tool {} not found", tool_req.name);
                     }
-                }));
-            } 
-            else {
-                error!("Tool {} not found", tool_req.name);
+
+                } else {
+                    warn!("Provider {} not registered", provider_name);
+                }
             }
         }
 

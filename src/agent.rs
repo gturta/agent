@@ -2,7 +2,7 @@ use async_openai::{Client, config::{Config, OpenAIConfig},
     types::responses::*
 };
 use tracing::{error, warn, info, debug};
-use crate::error::{Error, Result};
+use anyhow::{Result, anyhow};
 mod memory;
 mod tools;
 use memory::AgentMemory;
@@ -19,14 +19,14 @@ pub struct Agent<C: Config>{
     temp_response: String,
 }
 impl Agent<OpenAIConfig>{
-    pub fn build() -> Result<Self> {
+    pub async fn build() -> Result<Self> {
         let client = Client::new();
         let model = std::env::var("LLM_MODEL")
-            .map_err(|err|Error::Generic(format!("LLM_MODEL variable not defined: {:?}", err)))?; 
+            .map_err(|err|anyhow!("LLM_MODEL variable not defined: {:?}", err))?; 
         // build tools
         let tools = AgentTools::new()
             .with_web_search(false)
-            .build();
+            .build().await?;
         let memory = AgentMemory::new();
         Ok(Agent{
             client,

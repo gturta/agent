@@ -3,62 +3,22 @@ use std::pin::Pin;
 use std::future::Future;
 use std::collections::HashMap;
 use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, WebSearchToolArgs, FunctionCallOutputItemParam, FunctionCallOutput, OutputStatus};
-use serde_json::{Value,json};
-use serde::{de::DeserializeOwned, Serialize};
-use schemars::{JsonSchema, schema_for};
+use serde_json::Value;
 use tracing::{info, error, warn};
+use anyhow::Result;
 
-use crate::error::{Error, Result};
 mod local; 
 use local::LocalTools;
-
-pub trait ToolDefinition{
-    type Params;
-    type Output;
-    // required functions
-    fn name(&self) -> String;
-    fn description(&self) -> String;
-    fn execute(&self, args: Self::Params) -> impl std::future::Future<Output = Result<Self::Output>> + Send;
-}
+mod mcp_client;
+use mcp_client::{McpTools, McpConfig, McpTransport};
 
 trait ToolDefinitionDyn: Send + Sync{
     // required functions
-    fn tool_name(&self) -> String;
-    fn tool_description(&self) -> String;
-    fn tool_parameters(&self) -> Value;
+    fn tool_name(&self) -> &str;
+    fn tool_description(&self) -> &str;
+    fn tool_parameters(&self) -> &Value;
     fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_ >>;
 }
-impl<T> ToolDefinitionDyn for T 
-    where 
-        T: ToolDefinition + Send + Sync,
-        T::Params: JsonSchema + DeserializeOwned,
-        T::Output: Serialize
-{
-    fn tool_name(&self) -> String {
-        self.name()
-    }
-    fn tool_description(&self) -> String {
-        self.description()
-    }
-    fn tool_parameters(&self) -> Value {
-        let schema = schema_for!(T::Params);
-        serde_json::to_value(schema).unwrap_or(json!({ "type": "object" }))
-    }
-    fn tool_execute(&self, args: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_ >> {
-        Box::pin(async {
-            info!("Start tool execute: {}({})", self.name(), args);
-            let parsed_args: T::Params = serde_json::from_value(args)
-                .map_err(|e| Error::Serde(format!("Unable to parse params for {}: {}", self.name(), e)))?;
-
-            let output = self.execute(parsed_args).await
-                .map_err(|e| Error::Tool(format!("Tool {} execute error: {}", self.name(), e)))?;
-            let val = serde_json::to_value(output)
-                .map_err(|e| Error::Tool(format!("Tool {} output parse error: {}", self.name(), e)))?;
-            Ok(val)
-        })
-    }
-}
-
 trait ToolProvider {
     fn name(&self) -> String;
     fn tool_list(&self) -> Vec<Arc<dyn ToolDefinitionDyn + Send + Sync>> ; 
@@ -83,10 +43,16 @@ impl AgentTools{
         self.providers.insert(provider.name(), Arc::new(provider));
     }
 
-    pub fn build(mut self) -> Self {
+    pub async fn build(mut self) -> Result<Self> {
         let local = LocalTools::build();
         self.add_provider(local);
-        self
+        let mcp = McpTools::build(McpConfig{
+            transport: McpTransport::Stdio{
+                command: "../mcp/target/debug/mcp-server".to_string(), 
+                args: vec!["stdio".to_string()]
+            }}).await?;
+        self.add_provider(mcp);
+        Ok(self)
     }
     
     pub fn get_tools(&self) -> Vec<Tool> {
@@ -100,7 +66,7 @@ impl AgentTools{
                     // the tool name will be prefixed with the provider
                     .name(&qualified_name)
                         .description(custom_tool.tool_description())
-                        .parameters(custom_tool.tool_parameters())
+                        .parameters(custom_tool.tool_parameters().clone())
                         .build(){
                             info!("Adding tool {}", qualified_name);
                             tools.push(Tool::Function(tool));

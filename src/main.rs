@@ -3,7 +3,6 @@ use clap::{Parser,Subcommand};
 use std::io;
 use tracing::error;
 
-mod error;
 mod agent;
 
 #[derive(Parser)]
@@ -39,7 +38,7 @@ async fn main() {
 }
 
 async fn ask_question(query: &str) {
-    let mut agent = agent::Agent::build()
+    let mut agent = agent::Agent::build().await
         .expect("could not build agent");
     let answer = match agent.ask_one(query).await {
         Ok(answer) => answer,
@@ -52,7 +51,7 @@ async fn ask_question(query: &str) {
 }
 
 async fn chat_with_agent() {
-    let mut agent = agent::Agent::build()
+    let mut agent = agent::Agent::build().await
         .expect("could not build agent");
 
     // interactive loop

@@ -38,8 +38,13 @@ async fn main() {
 }
 
 async fn ask_question(query: &str) {
-    let mut agent = agent::Agent::build().await
-        .expect("could not build agent");
+    let mut agent = match agent::Agent::build().await{
+        Ok(agent) => agent,
+        Err(err) => {
+            error!("Could not build agent: {}", err);
+            return;
+        }
+    };
     let answer = match agent.ask_one(query).await {
         Ok(answer) => answer,
         Err(err) => {

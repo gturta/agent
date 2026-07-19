@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use async_openai::types::responses::{Tool, FunctionToolArgs, FunctionToolCall, WebSearchToolArgs, FunctionCallOutputItemParam, FunctionCallOutput, OutputStatus};
 use serde_json::Value;
 use tracing::{info, error, warn};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 mod local; 
 use local::LocalTools;
@@ -46,11 +46,16 @@ impl AgentTools{
     pub async fn build(mut self) -> Result<Self> {
         let local = LocalTools::build();
         self.add_provider(local);
-        let mcp = McpTools::build(McpConfig{
+        let mcp = match McpTools::build(McpConfig{
             transport: McpTransport::Stdio{
-                command: "../mcp/target/debug/mcp-server".to_string(), 
+                command: "./mcp-server".to_string(), 
                 args: vec!["stdio".to_string()]
-            }}).await?;
+            }}).await{
+            Ok(mcp) => mcp,
+            Err(err) => {
+                return Err(anyhow!("Could not build MCP config: {}", err));
+            }
+        };
         self.add_provider(mcp);
         Ok(self)
     }

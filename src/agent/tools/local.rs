@@ -1,5 +1,6 @@
     use std::sync::Arc;
     use std::collections::HashMap;
+    use tracing::info;
     use crate::agent::tools::{ToolDefinitionDyn, ToolProvider};
     use doc_search_tool::DocSearchTool;
     mod doc_search_tool;
@@ -30,6 +31,12 @@
 
         fn get(&self, function_name: &str) -> Option<Arc<dyn ToolDefinitionDyn + Send + Sync>> {
             self.custom_tools.get(function_name).cloned()
+        }
+
+        fn cleanup(&mut self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async{
+                info!("LocalTools cleanup called");
+            })
         }
     }
 

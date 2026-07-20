@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 mod local; 
 use local::LocalTools;
 mod mcp_client;
-use mcp_client::{McpTools, McpConfig, McpTransport};
+use mcp_client::{McpTools, McpConfig};
 
 trait ToolDefinitionDyn: Send + Sync{
     // required functions
@@ -23,12 +23,13 @@ trait ToolProvider {
     fn name(&self) -> String;
     fn tool_list(&self) -> Vec<Arc<dyn ToolDefinitionDyn + Send + Sync>> ; 
     fn get(&self, function: &str) -> Option<Arc<dyn ToolDefinitionDyn + Send + Sync>>;
+    fn cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 pub struct AgentTools{
     web_search: bool,
     execution_requests: Vec<FunctionToolCall>,
-    providers: HashMap<String, Arc<dyn ToolProvider>>,
+    providers: HashMap<String, Box<dyn ToolProvider>>,
 }
 
 impl AgentTools{
@@ -40,17 +41,20 @@ impl AgentTools{
         }
     }
     fn add_provider(&mut self, provider: impl ToolProvider + 'static) {
-        self.providers.insert(provider.name(), Arc::new(provider));
+        self.providers.insert(provider.name(), Box::new(provider));
     }
 
     pub async fn build(mut self) -> Result<Self> {
         let local = LocalTools::build();
         self.add_provider(local);
-        let mcp = match McpTools::build(McpConfig{
-            transport: McpTransport::Stdio{
-                command: "./mcp-server".to_string(), 
-                args: vec!["stdio".to_string()]
-            }}).await{
+        // test MCP
+        let mcp_config: McpConfig = serde_json::from_str(r#"{
+            "transport":{
+                "Stdio":{
+                    "command":"/home/gabi/rust_dev/test-mcp-server",
+                    "args":["stdio"]
+                }}}"#)?;
+        let mcp = match McpTools::build(mcp_config).await{
             Ok(mcp) => mcp,
             Err(err) => {
                 return Err(anyhow!("Could not build MCP config: {}", err));
@@ -91,8 +95,11 @@ impl AgentTools{
         self
     }
 
-    pub fn collect_execution_request(&mut self, function_call: &FunctionToolCall) {
+    pub fn reset_execution_requests(&mut self) {
         self.execution_requests.clear();
+    }
+
+    pub fn collect_execution_request(&mut self, function_call: &FunctionToolCall) {
         self.execution_requests.push(function_call.clone());
     }
 
@@ -112,6 +119,7 @@ impl AgentTools{
                         // concurrent execution
                         let tool_clone = tool.clone();
                         let req_clone = tool_req.clone();
+                        info!("FunctionToolCall {}/{} request queued", provider_name, function_name);
                         handles.push(tokio::spawn(async move {
                             // unpack arguments
                             let args: Value = serde_json::from_str(&req_clone.arguments)?;
@@ -159,6 +167,11 @@ impl AgentTools{
         Ok(output)
     }
 
+    pub async fn cleanup(&mut self) {
+        for provider in self.providers.values_mut(){
+            provider.cleanup().await;
+        }
+    }
 
 }
 

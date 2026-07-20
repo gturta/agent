@@ -79,6 +79,7 @@ impl<C: Config> Agent<C>{
 
     fn process_response(&mut self, response: Response) -> Result<()> {
         self.temp_response.clear();
+        self.tools.reset_execution_requests();
         // update memory from response
         self.memory.history_from_response(&response);
         // Process Response.output

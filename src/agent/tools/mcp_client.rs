@@ -2,13 +2,16 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::process::Command;
 use rmcp::{RoleClient, transport::{StreamableHttpClientTransport, child_process::TokioChildProcess}, service::{ServiceExt, RunningService}, model::CallToolRequestParams};
-use crate::{agent::tools::{ToolDefinitionDyn, ToolProvider} };
 use anyhow::{anyhow, Result};
-use tracing::{info, error};
+use tracing::{info, error, debug, warn};
+use serde::Deserialize;
+use crate::{agent::tools::{ToolDefinitionDyn, ToolProvider} };
 
+#[derive(Deserialize)]
 pub struct McpConfig {
     pub transport: McpTransport,
 }
+#[derive(Deserialize)]
 pub enum McpTransport{
     Stdio{
         command: String,
@@ -21,7 +24,7 @@ pub enum McpTransport{
 pub struct McpTools {
     name: String,
     tools: HashMap<String, Arc<McpTool>>, 
-    service: Arc<RunningService<RoleClient, ()>>,
+    service: Option<Arc<RunningService<RoleClient, ()>>>,
 }
 
 impl McpTools {
@@ -38,6 +41,11 @@ impl McpTools {
                 ().serve(transport).await?
             },
         };
+        let server_name = match service.peer_info() {
+            Some(info) => info.server_info.name.clone(),
+            None => "unnamed".to_string(),
+        };
+        info!("Querying MCP server {}", server_name);
         let service = Arc::new(service);
         let mut tools = HashMap::new();
         let mcp_tools = service.list_all_tools().await?;
@@ -46,11 +54,12 @@ impl McpTools {
             tools.insert(tool.tool_name().to_string(), Arc::new(tool));
         }
         Ok(McpTools {
-            name: "mcp_server".to_string(),
+            name: server_name,
             tools,
-            service,
+            service: Some(service),
         })
     }
+
 }
 
 impl ToolProvider for McpTools {
@@ -67,6 +76,18 @@ impl ToolProvider for McpTools {
     fn get(&self, function_name: &str) -> Option<Arc<dyn ToolDefinitionDyn + Send + Sync>> {
         let tool = self.tools.get(function_name).cloned();
         tool.map(|a| a as Arc<dyn ToolDefinitionDyn + Send + Sync>)
+    }
+
+    fn cleanup(&mut self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        info!("McpTools cleanup called");
+        if let Some(service) = self.service.take()
+            && let Ok(service) = Arc::try_unwrap(service) {
+                info!("Closing MCP service connection");
+                return Box::pin(async {
+                    let _ = service.cancel().await;
+                });
+        }
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -101,7 +122,8 @@ impl ToolDefinitionDyn for McpTool {
 
     fn tool_execute(&self, args: serde_json::Value) -> std::pin::Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send + '_ >> {
         let name = self.tool_name().to_owned();
-        info!("Executing MCP tool {}", name);
+        info!("Executing MCP tool: {}", name);
+        debug!("Call MCPT tool {} with params: {}", name, args);
         Box::pin(async move {
             match args {
                 serde_json::Value::Object(args_map) => {
@@ -112,6 +134,7 @@ impl ToolDefinitionDyn for McpTool {
                         error!("MCP tool {} returned invalid output", name);
                         return Err(anyhow!("MCP invalid result"));
                     };
+                    debug!("MCP tool {} returned: {}", name, output);
                     Ok(output)
                 },
                 other => {
